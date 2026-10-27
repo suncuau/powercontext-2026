@@ -85,7 +85,7 @@ from powercontext.builtin.persistence.memory_index import CompositeMemoryIndex, 
 from powercontext.builtin.persistence.oceanbase.experience_index import OceanBaseExperienceFTSIndex
 from powercontext.builtin.persistence.oceanbase.memory_index import (
     OceanBaseMemoryFTSIndex,
-    OceanBaseMemoryVectorIndex,
+    OceanBaseMemoryHybridIndex,
 )
 from powercontext.builtin.persistence.oceanbase.profile import OceanBaseConfig, OceanBaseProfile
 from powercontext.builtin.persistence.oceanbase.topic_memory_index import (
@@ -913,6 +913,7 @@ async def open_builtin_contexts(
                     connection, configure_retrieval_shape=not _topic_memory_worker
                 )
             contexts = RelationalContexts(
+            source_count_thresholds=_source_count_thresholds(config),
                 database=profile.database,
                 index=index,
                 topic_memory_index=topic_index,
@@ -960,10 +961,11 @@ async def open_builtin_contexts(
                 await contexts.aclose_usage_recorder()
         return
     experience_index = OceanBaseExperienceFTSIndex()
-    indexes = [OceanBaseMemoryFTSIndex()]
-    if embedding_model is not None:
-        indexes.append(OceanBaseMemoryVectorIndex(embedding_model.profile))
-    index = CompositeMemoryIndex(*indexes)
+    index = (
+        OceanBaseMemoryHybridIndex(embedding_model.profile)
+        if embedding_model is not None
+        else OceanBaseMemoryFTSIndex()
+    )
     topic_indexes: list[TopicMemoryIndex] = [OceanBaseTopicMemoryFTSIndex()]
     if embedding_model is not None:
         topic_indexes.append(OceanBaseTopicMemoryVectorIndex(embedding_model.profile))
@@ -990,6 +992,7 @@ async def open_builtin_contexts(
                 connection, configure_retrieval_shape=not _topic_memory_worker
             )
         contexts = RelationalContexts(
+            source_count_thresholds=_source_count_thresholds(config),
             database=profile.database,
             index=index,
             topic_memory_index=topic_index,
@@ -1850,3 +1853,16 @@ def _search_modes(capabilities: MemoryCapabilities) -> tuple[MemorySearchMode, .
 
 
 __all__ = ["BuiltinConfigurationError", "open_builtin_contexts", "open_builtin_runtime", "preflight_builtin_runtime"]
+
+
+def _source_count_thresholds(config: BuiltinConfig) -> dict[str, int]:
+    """Return the configured per-binding Source count thresholds."""
+
+    from powercontext.builtin.artifacts.topic_memory import TOPIC_MEMORY_SOURCE_WINDOW_BINDING
+    from powercontext.builtin.triggers import SOURCE_WINDOW_TRIGGER_NAME
+
+    thresholds = {
+        SOURCE_WINDOW_TRIGGER_NAME: config.runtime.memory_source_count_threshold,
+        TOPIC_MEMORY_SOURCE_WINDOW_BINDING: config.runtime.topic_memory_source_count_threshold,
+    }
+    return {name: value for name, value in thresholds.items() if value is not None}

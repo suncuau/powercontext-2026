@@ -43,6 +43,10 @@ from powercontext.builtin.persistence.family_management import (
 )
 from powercontext.builtin.persistence.memory import RelationalMemoryBackend
 from powercontext.builtin.persistence.processing import ArtifactProcessingPendingRepository
+from powercontext.builtin.persistence.source_lifecycle import (
+    SourceLifecycleNodeRepository,
+    StoredLifecycleNode,
+)
 from powercontext.builtin.persistence.sources import SourceRepository, StoredSource
 from powercontext.builtin.persistence.tables import (
     ARTIFACT_HEADS_TABLE,
@@ -218,6 +222,23 @@ class RelationalRecordService:
         except StoredPayloadConflictError as error:
             raise BaseValueConflictError("source", (scope_id, source_type, source.name)) from error
         return _source_record(scope_id, stored)
+
+    async def load_lifecycle_nodes(self, scope_id: str, /) -> tuple[StoredLifecycleNode, ...]:
+        """Return one Scope's persisted lifecycle graph in registration order."""
+
+        async with self._database.transaction() as connection:
+            return await SourceLifecycleNodeRepository().load_scope(connection, scope_id)
+
+    async def replace_lifecycle_nodes(
+        self,
+        scope_id: str,
+        nodes: tuple[StoredLifecycleNode, ...],
+        /,
+    ) -> None:
+        """Replace one Scope's persisted lifecycle graph in one transaction."""
+
+        async with self._database.transaction() as connection:
+            await SourceLifecycleNodeRepository().replace_scope(connection, scope_id, nodes)
 
     async def get_source(self, scope_id: str, source_type: str, source_id: str, /) -> SourceRecord:
         self._require_content_source(source_type)

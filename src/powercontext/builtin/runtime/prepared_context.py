@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from itertools import chain
@@ -106,6 +107,17 @@ class PreparedContextBuild:
     origins: tuple[PreparedContextOrigin, ...]
     omissions: PreparedContextOmissions = PreparedContextOmissions()
     code_origins: tuple[CodeEvidenceRef, ...] = ()
+    fragments: tuple[PreparedContextFragment, ...] = ()
+
+
+@dataclass(frozen=True)
+class PreparedContextFragment:
+    """One literal slice of a Memory entry selected for the current query."""
+
+    address: MemoryEntryAddress
+    start: int
+    end: int
+    text: str
 
 
 @dataclass(frozen=True)
@@ -161,6 +173,71 @@ class PreparedContextBuilder:
     def empty(self) -> PreparedContext:
         return PreparedContext(status="empty", content=None, content_bytes=0)
 
+    def _build_evidence_selection(
+        self,
+        request: PrepareContextRequest,
+        memory_candidates: Sequence[PreparedMemoryCandidates],
+    ) -> PreparedContextBuild:
+        """Select literal query-relevant sentences that fit the whole output budget."""
+
+        fragments: list[PreparedContextFragment] = []
+        items: list[dict[str, object]] = []
+        for fragment, citation in self._ranked_fragments(request.query, memory_candidates):
+            candidate = [
+                *items,
+                {
+                    "citation": citation,
+                    "content": fragment.text,
+                    "start": fragment.start,
+                    "end": fragment.end,
+                },
+            ]
+            if _rendered_selection_bytes(candidate) > request.max_bytes:
+                continue
+            items = candidate
+            fragments.append(fragment)
+            if len(fragments) >= _MAX_SELECTED_FRAGMENTS:
+                break
+        if not fragments:
+            return PreparedContextBuild(context=self.empty(), origins=())
+        content = _render_selection(items)
+        return PreparedContextBuild(
+            context=PreparedContext(status="ready", content=content, content_bytes=len(content.encode("utf-8"))),
+            origins=tuple(fragment.address for fragment in fragments),
+            fragments=tuple(fragments),
+        )
+
+    def _ranked_fragments(
+        self,
+        query: str,
+        memory_candidates: Sequence[PreparedMemoryCandidates],
+    ) -> list[tuple[PreparedContextFragment, dict[str, object]]]:
+        terms, characters = _selection_terms(query)
+        ranked: list[tuple[float, int, PreparedContextFragment, dict[str, object]]] = []
+        for group in memory_candidates:
+            for hit in group.hits[: self.memory_candidate_limit]:
+                if hit.memory_ref is None:
+                    continue
+                address = MemoryEntryAddress(
+                    memory=ArtifactAddress(scope_id=group.scope_id, artifact=hit.memory_ref),
+                    entry_id=hit.entry_id,
+                    entry_version_id=hit.entry_version_id,
+                )
+                citation: dict[str, object] = {
+                    "scope_id": group.scope_id,
+                    "memory_ref": hit.memory_ref.model_dump(mode="json"),
+                    "entry_id": hit.entry_id,
+                    "entry_version_id": hit.entry_version_id,
+                }
+                for start, end in _sentence_spans(hit.text):
+                    text = hit.text[start:end]
+                    score = _selection_score(terms, characters, text)
+                    if score <= 0:
+                        continue
+                    ranked.append((score, -start, PreparedContextFragment(address, start, end, text), citation))
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        return [(fragment, citation) for _score, _position, fragment, citation in ranked]
+
     def build(
         self,
         *,
@@ -211,6 +288,8 @@ class PreparedContextBuilder:
         profile_candidates: Sequence[PreparedProfileCandidate] = (),
         code_candidates: Sequence[PreparedCodeCandidate] = (),
     ) -> PreparedContextBuild:
+        if request.evidence_selection:
+            return self._build_evidence_selection(request, memory_candidates)
         if request.include_code:
 
             def historical(history_request: PrepareContextRequest, entries: int) -> PreparedContextBuild:
@@ -683,6 +762,113 @@ def _interleave_groups(groups: Sequence[Sequence[_Item]]) -> tuple[_Item, ...]:
     for index in range(max((len(group) for group in groups), default=0)):
         ordered.extend(group[index] for group in groups if index < len(group))
     return tuple(ordered)
+
+
+_MAX_SELECTED_FRAGMENTS = 24
+_SELECTION_TERM = re.compile(r"[a-z]+|\d+")
+_SENTENCE_PATTERN = re.compile(r"[^.!?\n]+[.!?]*")
+_CJK_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+_SELECTION_STOPWORDS = frozenset({
+    "a",
+    "an",
+    "the",
+    "and",
+    "or",
+    "of",
+    "to",
+    "in",
+    "on",
+    "at",
+    "by",
+    "for",
+    "from",
+    "with",
+    "as",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "being",
+    "that",
+    "this",
+    "these",
+    "those",
+    "it",
+    "its",
+    "we",
+    "our",
+    "you",
+    "your",
+    "they",
+    "their",
+    "them",
+    "there",
+    "has",
+    "have",
+    "had",
+    "do",
+    "does",
+    "did",
+    "can",
+    "could",
+    "should",
+    "would",
+    "what",
+    "which",
+    "who",
+    "how",
+    "why",
+    "when",
+    "where",
+    "not",
+    "no",
+    "than",
+    "then",
+    "so",
+    "such",
+    "may",
+    "might",
+})
+
+
+def _selection_terms(value: str) -> tuple[set[str], set[str]]:
+    folded = value.casefold()
+    terms = {term for term in _SELECTION_TERM.findall(folded) if term not in _SELECTION_STOPWORDS}
+    return terms, set(_CJK_PATTERN.findall(folded))
+
+
+def _sentence_spans(text: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    for match in _SENTENCE_PATTERN.finditer(text):
+        raw = match.group()
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        start = match.start() + (len(raw) - len(raw.lstrip()))
+        spans.append((start, start + len(stripped)))
+    return spans
+
+
+def _selection_score(terms: set[str], characters: set[str], text: str) -> float:
+    if not terms and not characters:
+        return 0.0
+    folded = text.casefold()
+    score = float(len(terms.intersection(_SELECTION_TERM.findall(folded))))
+    if characters:
+        score += 0.5 * len(characters.intersection(_CJK_PATTERN.findall(folded)))
+    return score
+
+
+def _render_selection(items: Sequence[dict[str, object]]) -> str:
+    envelope = {"trust": "untrusted_history", "items": list(items)}
+    encoded = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+    return "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
+
+
+def _rendered_selection_bytes(items: Sequence[dict[str, object]]) -> int:
+    return len(_render_selection(items).encode("utf-8"))
 
 
 def _render(entries: Sequence[_PreparedContextEntry]) -> str:

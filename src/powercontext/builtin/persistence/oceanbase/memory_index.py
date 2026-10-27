@@ -495,6 +495,160 @@ class OceanBaseMemoryVectorIndex:
         return tuple(hydrated)
 
 
+_OCEANBASE_HYBRID_SEARCH_SQL = """
+SELECT
+    h.memory_artifact_id,
+    h.head_revision,
+    h.entry_id,
+    h.entry_version_id,
+    v.text,
+    l2_distance(m.embedding, :query_vector) AS distance
+FROM pc_memory_entry_heads AS h
+JOIN pc_memory_vector_entries AS m
+  ON m.scope_id = h.scope_id
+ AND m.memory_artifact_id = h.memory_artifact_id
+ AND m.entry_id = h.entry_id
+ AND m.entry_version_id = h.entry_version_id
+JOIN pc_memory_entry_versions AS v
+  ON v.scope_id = h.scope_id
+ AND v.memory_artifact_id = h.memory_artifact_id
+ AND v.entry_version_id = h.entry_version_id
+WHERE h.scope_id = :scope_id
+  AND h.memory_artifact_id IN :memory_artifact_ids
+  AND MATCH (h.searchable_text) AGAINST (:query)
+ORDER BY l2_distance(m.embedding, :query_vector) APPROXIMATE
+LIMIT :candidate_limit
+"""
+
+
+class OceanBaseMemoryHybridIndex:
+    """One native statement that filters with FULLTEXT and ranks by vector distance.
+
+    OceanBase and seekdb combine a FULLTEXT predicate with a vector ORDER BY in
+    a single query, so hybrid search needs one round trip: the keyword index
+    selects candidate rows and the HNSW index orders them.
+    """
+
+    def __init__(self, profile: EmbeddingProfile) -> None:
+        self._fts = OceanBaseMemoryFTSIndex()
+        self._vector = OceanBaseMemoryVectorIndex(profile)
+        self.profile = profile
+        self.capabilities = MemoryCapabilities(
+            fts=True,
+            vector=True,
+            hybrid=True,
+            embedding_profile=profile,
+            tag_filter=True,
+        )
+        self.tables = self._vector.tables
+        self._hybrid_sql = text(_OCEANBASE_HYBRID_SEARCH_SQL).bindparams(
+            bindparam("memory_artifact_ids", expanding=True),
+            bindparam("query_vector", type_=VECTOR(profile.dimension)),
+        )
+        self._tagged_hybrid_sql = text(
+            _OCEANBASE_HYBRID_SEARCH_SQL.replace("ORDER BY", memory_tag_sql("h") + "ORDER BY").replace(
+                " APPROXIMATE", ""
+            )
+        ).bindparams(
+            bindparam("memory_artifact_ids", expanding=True),
+            bindparam("tag_keys", expanding=True),
+            bindparam("tag_hashes", expanding=True),
+            bindparam("query_vector", type_=VECTOR(profile.dimension)),
+        )
+
+    async def initialize(self, connection: AsyncConnection, /) -> None:
+        await self._fts.initialize(connection)
+        await self._vector.initialize(connection)
+
+    async def replace(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        memory_ref: ArtifactRef,
+        projections: tuple[MemoryProjection, ...],
+        /,
+    ) -> None:
+        await self._fts.replace(connection, scope_id, memory_ref, projections)
+        await self._vector.replace(connection, scope_id, memory_ref, projections)
+
+    async def delete(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        memory_ref: ArtifactRef,
+        entry_ids: tuple[str, ...],
+        /,
+    ) -> None:
+        await self._fts.delete(connection, scope_id, memory_ref, entry_ids)
+        await self._vector.delete(connection, scope_id, memory_ref, entry_ids)
+
+    async def upsert(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        memory_ref: ArtifactRef,
+        projections: tuple[MemoryProjection, ...],
+        /,
+    ) -> None:
+        await self._fts.upsert(connection, scope_id, memory_ref, projections)
+        await self._vector.upsert(connection, scope_id, memory_ref, projections)
+
+    async def search(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        request: MemorySearchRequest,
+        /,
+    ) -> MemorySearchChannels:
+        if request.mode == "fts":
+            return await self._fts.search(connection, scope_id, request)
+        if request.mode == "vector":
+            return await self._vector.search(connection, scope_id, request)
+        if request.mode != "hybrid":
+            return MemorySearchChannels()
+        if request.embedding_profile != self.profile or request.query_vector is None:
+            raise CapabilityNotSupportedError("embedding-profile")
+        if not await self._vector.vector_complete(connection, scope_id, request.memories, self.profile):
+            raise CapabilityNotSupportedError("vector")
+
+        parameters: dict[str, object] = {
+            "scope_id": scope_id,
+            "memory_artifact_ids": tuple(memory.artifact_id for memory in request.memories),
+            "query": request.analyzed_query,
+            "query_vector": validate_embedding(request.query_vector, dimension=self.profile.dimension),
+            "candidate_limit": request.candidate_limit,
+        }
+        statement = self._hybrid_sql
+        if request.tag_filter is not None:
+            statement = self._tagged_hybrid_sql
+            parameters.update(memory_tag_parameters(request.tag_filter))
+        rows = (await connection.execute(statement, parameters)).mappings()
+        # The single statement satisfied the FULLTEXT predicate and produced a
+        # vector distance for every row, so it is both channel rankings.
+        hits = memory_channel_hits(rows, request.memories)
+        return MemorySearchChannels(fts=hits, vector=hits)
+
+    async def vector_complete(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        memories: tuple[ArtifactRef, ...],
+        profile: EmbeddingProfile,
+        /,
+    ) -> bool:
+        return await self._vector.vector_complete(connection, scope_id, memories, profile)
+
+    async def hydrate(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        projections: tuple[MemoryProjection, ...],
+        /,
+    ) -> tuple[MemoryProjection, ...]:
+        await self._fts.hydrate(connection, scope_id, projections)
+        return await self._vector.hydrate(connection, scope_id, projections)
+
+
 def _embedding_hash(profile: EmbeddingProfile, entry_hash: str) -> str:
     return embedding_content_hash(
         profile_id=profile.profile_id,
