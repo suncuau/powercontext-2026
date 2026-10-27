@@ -79,7 +79,10 @@ class SourceRepository:
         self,
         definitions: SourceDefinitionRegistry | Iterable[_AnySourceAdapter],
         /,
+        *,
+        count_thresholds: Mapping[str, int] | None = None,
     ) -> None:
+        self._count_thresholds = dict(count_thresholds or {})
         self._registry = (
             definitions
             if isinstance(definitions, SourceDefinitionRegistry)
@@ -171,7 +174,32 @@ class SourceRepository:
         intents = ArtifactProcessingIntentRepository()
         for binding_name in SOURCE_PROCESSING_BINDINGS:
             await intents.mark_dirty(connection, scope_id, binding_name)
+        await self._admit_count_thresholds(connection, scope_id, position)
         return StoredSource(ref=ref, value=source, journal_position=position), True
+
+    async def _admit_count_thresholds(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        position: int,
+        /,
+    ) -> None:
+        """Request one processing window once pending input reaches a configured threshold."""
+
+        if not self._count_thresholds:
+            return
+        from powercontext.builtin.persistence.cursors import SourceCursorRepository
+
+        cursors = SourceCursorRepository()
+        intents = ArtifactProcessingIntentRepository()
+        for binding_name in SOURCE_PROCESSING_BINDINGS:
+            threshold = self._count_thresholds.get(binding_name)
+            if threshold is None:
+                continue
+            cursor = await cursors.load(connection, scope_id, binding_name)
+            consumed = 0 if cursor is None else cursor.cursor.sequence
+            if position - consumed >= threshold:
+                await intents.request(connection, scope_id, binding_name)
 
     async def get(
         self,

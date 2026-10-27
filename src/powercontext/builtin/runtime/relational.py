@@ -544,6 +544,7 @@ class RelationalContexts:
         handoff_verification_keys: tuple[bytes, ...] = (),
         topic_memory_write_timeout_seconds: float = 30.0,
         topic_memory_write_concurrency: int = 4,
+        source_count_thresholds: dict[str, int] | None = None,
         model_usage_queue_capacity: int = 256,
         model_usage_write_timeout_seconds: float = 1.0,
         model_usage_flush_timeout_seconds: float = 0.5,
@@ -554,7 +555,10 @@ class RelationalContexts:
         self.index = NoMemoryIndex() if index is None else index
         self.topic_memory_index = NoTopicMemoryIndex() if topic_memory_index is None else topic_memory_index
         self.experience_index = NoExperienceIndex() if experience_index is None else experience_index
-        source_repository = SourceRepository(self.source_registry)
+        source_repository = SourceRepository(
+            self.source_registry,
+            count_thresholds=source_count_thresholds,
+        )
         artifact_repository = ArtifactRepository(
             (Handoff, Memory, Experience, Skill, Profile, Prompt, TopicMemory),
             sources=source_repository,
