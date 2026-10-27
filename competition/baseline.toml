@@ -1,5 +1,0 @@
-repository = "https://github.com/oceanbase/powercontext.git"
-repository_id = 1093180734
-ref = "refs/tags/powercontext-v1.2.0"
-commit = "9db1753434162c0aa7c9f1189a1722e617880a52"
-python = "3.12"
